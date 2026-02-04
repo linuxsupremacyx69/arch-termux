@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 ################################################################################
 # Termux Arch Linux Chroot Environment Manager
-# Version: 2.0.0
+# Version: 2.1.0 - BusyBox Compatible
 # Architecture: ARM64 (AArch64)
 # Features: Native GUI (KDE Plasma), Backup/Restore, Automation, Fixes
 ################################################################################
@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Configuration
 readonly PROG_NAME="arch-termux"
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly ARCH_ROOT="${ARCH_ROOT:-/data/data/com.termux/files/arch}"
 readonly ARCH_IMAGE_URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 readonly TERMUX_HOME="/data/data/com.termux/files/home"
@@ -28,6 +28,28 @@ log() { echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+
+# BusyBox compatible download function
+download_file() {
+    local url="$1"
+    local output="$2"
+    
+    # Try different downloaders in order of preference
+    if command -v curl >/dev/null 2>&1; then
+        # curl is available (best option)
+        curl -L -o "$output" --progress-bar "$url"
+    elif wget --help 2>&1 | grep -q "\-\-show-progress"; then
+        # GNU wget with progress
+        wget --show-progress -O "$output" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        # BusyBox wget (no progress bar, silent)
+        log "Downloading (BusyBox wget - no progress bar)..."
+        wget -q -O "$output" "$url" || return 1
+    else
+        error "No download tool found (install curl or wget)"
+        return 1
+    fi
+}
 
 # Check root
 check_root() {
@@ -134,14 +156,28 @@ install_base() {
     local tarball="$temp_dir/arch.tar.gz"
     
     log "Downloading Arch Linux ARM..."
-    if ! wget -q --show-progress -O "$tarball" "$ARCH_IMAGE_URL"; then
+    log "URL: $ARCH_IMAGE_URL"
+    
+    if ! download_file "$ARCH_IMAGE_URL" "$tarball"; then
         error "Download failed"
         rm -rf "$temp_dir"
         exit 1
     fi
     
+    log "Download complete: $(ls -lh "$tarball" | awk '{print $5}')"
     log "Extracting to $ARCH_ROOT..."
-    tar -xzf "$tarball" -C "$ARCH_ROOT" --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*'
+    
+    # BusyBox compatible extraction (no --exclude support in some versions)
+    if tar --help 2>&1 | grep -q "\-\-exclude"; then
+        # GNU tar
+        tar -xzf "$tarball" -C "$ARCH_ROOT" --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*'
+    else
+        # BusyBox tar - extract then clean
+        tar -xzf "$tarball" -C "$ARCH_ROOT"
+        # Clean up virtual filesystems
+        rm -rf "$ARCH_ROOT/dev"/* "$ARCH_ROOT/proc"/* "$ARCH_ROOT/sys"/* 2>/dev/null || true
+    fi
+    
     rm -rf "$temp_dir"
     
     # Create essential files
@@ -208,15 +244,20 @@ EOF
     chmod +x "$ARCH_ROOT/etc/profile.d/termux-fixes.sh"
     
     # Pacman configuration optimizations
-    sed -i 's/#Color/Color/' "$ARCH_ROOT/etc/pacman.conf"
-    sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 5/' "$ARCH_ROOT/etc/pacman.conf"
-    sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' "$ARCH_ROOT/etc/makepkg.conf"
+    if [[ -f "$ARCH_ROOT/etc/pacman.conf" ]]; then
+        sed -i 's/#Color/Color/' "$ARCH_ROOT/etc/pacman.conf" 2>/dev/null || true
+        sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 5/' "$ARCH_ROOT/etc/pacman.conf" 2>/dev/null || true
+    fi
+    
+    if [[ -f "$ARCH_ROOT/etc/makepkg.conf" ]]; then
+        sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' "$ARCH_ROOT/etc/makepkg.conf" 2>/dev/null || true
+    fi
     
     # Initialize pacman keyring in chroot
     log "Initializing pacman keyring..."
     chroot "$ARCH_ROOT" /bin/bash -c '
-        pacman-key --init
-        pacman-key --populate archlinuxarm
+        pacman-key --init 2>/dev/null || true
+        pacman-key --populate archlinuxarm 2>/dev/null || true
         pacman -Sy archlinux-keyring --noconfirm 2>/dev/null || true
     ' || warn "Keyring initialization may need manual completion"
     
@@ -254,32 +295,12 @@ install_gui() {
     chroot "$ARCH_ROOT" /bin/bash -c 'pacman -Syu --noconfirm' || true
     
     # Install KDE Plasma and essential apps
-    local packages=(
-        # Core Plasma
-        plasma-meta plasma-workspace plasma-desktop
-        # Display/Session management
-        sddm xorg-server xorg-xinit
-        # Essential KDE apps
-        dolphin konsole kate systemsettings5
-        # Networking
-        network-manager-applet
-        # Audio
-        pulseaudio pulseaudio-alsa pavucontrol
-        # Fonts and themes
-        noto-fonts noto-fonts-cjk ttf-dejavu
-        breeze-gtk kde-gtk-config
-        # Utilities
-        wget curl git vim nano htop
-        # Build tools
-        base-devel cmake
-        # X11 support for Termux
-        xorg-xauth xorg-xhost
-    )
+    local packages="plasma-meta plasma-workspace plasma-desktop sddm xorg-server xorg-xinit dolphin konsole kate systemsettings5 network-manager-applet pulseaudio pulseaudio-alsa pavucontrol noto-fonts noto-fonts-cjk ttf-dejavu breeze-gtk kde-gtk-config wget curl git vim nano htop base-devel cmake xorg-xauth xorg-xhost"
     
     chroot "$ARCH_ROOT" /bin/bash -c "
-        pacman -S --needed --noconfirm ${packages[*]} 2>&1 || {
-            echo 'Some packages failed, retrying with individual installs...'
-            for pkg in ${packages[*]}; do
+        pacman -S --needed --noconfirm $packages 2>&1 || {
+            echo 'Some packages failed, retrying individually...'
+            for pkg in $packages; do
                 pacman -S --needed --noconfirm \$pkg 2>/dev/null || echo \"Failed: \$pkg\"
             done
         }
@@ -333,7 +354,7 @@ EOF
 # Bridge between Termux-X11 and Arch chroot
 
 # Wait for X11 socket
-for i in {1..30}; do
+for i in $(seq 1 30); do
     if [[ -S "/tmp/.X11-unix/X${DISPLAY#*:}" ]] || [[ -S "/data/data/com.termux/files/usr/tmp/.X11-unix/X${DISPLAY#*:}" ]]; then
         break
     fi
@@ -490,7 +511,7 @@ EOF
 
 ARCH_ROOT="/data/data/com.termux/files/arch"
 SNAPSHOT_DIR="${TERMUX_HOME}/arch-snapshots"
-ARCHIVE_FORMAT="zst"  # zst, gz, xz
+ARCHIVE_FORMAT="zst"
 
 mkdir -p "$SNAPSHOT_DIR"
 
@@ -498,12 +519,10 @@ usage() {
     echo "Usage: arch-snapshot [create|restore|list|delete] [name]"
     echo ""
     echo "Commands:"
-    echo "  create [name]  - Create new snapshot (default: auto-timestamp)"
+    echo "  create [name]  - Create new snapshot"
     echo "  restore <name> - Restore from snapshot"
     echo "  list          - List available snapshots"
     echo "  delete <name> - Delete snapshot"
-    echo ""
-    echo "Snapshots stored in: $SNAPSHOT_DIR"
 }
 
 create_snapshot() {
@@ -532,20 +551,31 @@ create_snapshot() {
         umount -l '$ARCH_ROOT/sdcard' 2>/dev/null || true
     "
     
-    # Create archive excluding unnecessary paths
     cd "$ARCH_ROOT"
-    tar --exclude='./proc/*' \
-        --exclude='./sys/*' \
-        --exclude='./dev/*' \
-        --exclude='./run/*' \
-        --exclude='./tmp/*' \
-        --exclude='./mnt/*' \
-        --exclude='./media/*' \
-        --exclude='./var/cache/pacman/pkg/*' \
-        --exclude='./var/log/journal/*' \
-        --exclude='./root/.cache/*' \
-        --exclude='./home/*/.cache/*' \
-        -cf - . | zstd -T0 -19 > "$file"
+    
+    # Check for zstd
+    if command -v zstd >/dev/null 2>&1; then
+        tar --exclude='./proc' \
+            --exclude='./sys' \
+            --exclude='./dev' \
+            --exclude='./run' \
+            --exclude='./tmp' \
+            --exclude='./mnt' \
+            --exclude='./media' \
+            -cf - . | zstd -T0 -19 > "$file"
+    else
+        # Fallback to gzip
+        file="${file%.zst}.gz"
+        tar -czf "$file" \
+            --exclude='./proc' \
+            --exclude='./sys' \
+            --exclude='./dev' \
+            --exclude='./run' \
+            --exclude='./tmp' \
+            --exclude='./mnt' \
+            --exclude='./media' \
+            .
+    fi
     
     echo "Snapshot created: $file"
     ls -lh "$file"
@@ -553,25 +583,17 @@ create_snapshot() {
 
 restore_snapshot() {
     local name="$1"
-    local file="$SNAPSHOT_DIR/arch-${name}.tar.$ARCHIVE_FORMAT"
+    local file=""
     
-    if [[ -z "$name" ]]; then
-        echo "Error: Specify snapshot name"
-        list_snapshots
-        return 1
-    fi
+    # Find file with any extension
+    for ext in zst gz xz bz2; do
+        if [[ -f "$SNAPSHOT_DIR/arch-${name}.tar.$ext" ]]; then
+            file="$SNAPSHOT_DIR/arch-${name}.tar.$ext"
+            break
+        fi
+    done
     
-    if [[ ! -f "$file" ]]; then
-        # Try to find with different extensions
-        for ext in zst gz xz bz2; do
-            if [[ -f "$SNAPSHOT_DIR/arch-${name}.tar.$ext" ]]; then
-                file="$SNAPSHOT_DIR/arch-${name}.tar.$ext"
-                break
-            fi
-        done
-    fi
-    
-    if [[ ! -f "$file" ]]; then
+    if [[ -z "$file" ]]; then
         echo "Error: Snapshot not found: $name"
         list_snapshots
         return 1
@@ -583,7 +605,6 @@ restore_snapshot() {
     
     echo "Restoring from: $file"
     
-    # Unmount and clean
     su -c "
         cd /
         fuser -k '$ARCH_ROOT' 2>/dev/null || true
@@ -592,12 +613,18 @@ restore_snapshot() {
         rm -rf '${ARCH_ROOT:?}'/*
     "
     
-    # Extract
     mkdir -p "$ARCH_ROOT"
     cd "$ARCH_ROOT"
     
     case "$file" in
-        *.zst) zstd -dc "$file" | tar xf - ;;
+        *.zst) 
+            if command -v zstd >/dev/null 2>&1; then
+                zstd -dc "$file" | tar xf -
+            else
+                echo "Error: zstd not installed"
+                return 1
+            fi
+            ;;
         *.gz)  tar xzf "$file" ;;
         *.xz)  tar xJf "$file" ;;
         *.bz2) tar xjf "$file" ;;
@@ -608,8 +635,10 @@ restore_snapshot() {
 }
 
 list_snapshots() {
-    echo "Available snapshots in $SNAPSHOT_DIR:"
-    ls -lh "$SNAPSHOT_DIR"/arch-*.tar.* 2>/dev/null | awk '{print $9, "("$5")", $6, $7, $8}' | sed 's|.*/arch-||; s|\.tar\..*||' || echo "No snapshots found"
+    echo "Available snapshots:"
+    ls -lh "$SNAPSHOT_DIR"/arch-*.tar.* 2>/dev/null | while read -r line; do
+        echo "$line" | awk '{print $9, "("$5")", $6, $7, $8}' | sed 's|.*/arch-||; s|\.tar\..*||'
+    done || echo "No snapshots found"
 }
 
 delete_snapshot() {
@@ -629,155 +658,4 @@ delete_snapshot() {
     echo "Snapshot not found: $name"
 }
 
-case "${1:-}" in
-    create)  create_snapshot "${2:-}" ;;
-    restore) restore_snapshot "$2" ;;
-    list)    list_snapshots ;;
-    delete)  delete_snapshot "$2" ;;
-    *)       usage ;;
-esac
-EOF
-    chmod +x "$TERMUX_PREFIX/bin/arch-snapshot"
-    
-    # Update script
-    cat > "$TERMUX_PREFIX/bin/arch-update" << 'EOF'
-#!/data/data/com.termux/files/usr/bin/bash
-# Update Arch Linux system
-
-ARCH_ROOT="/data/data/com.termux/files/arch"
-
-echo "Updating Arch Linux system..."
-
-# Mount if needed
-su -c "
-    mountpoint -q '$ARCH_ROOT/proc' || {
-        mount -o bind /dev '$ARCH_ROOT/dev'
-        mount -o bind /dev/pts '$ARCH_ROOT/dev/pts'
-        mount -o bind /proc '$ARCH_ROOT/proc'
-        mount -o bind /sys '$ARCH_ROOT/sys'
-        mount -t tmpfs tmpfs '$ARCH_ROOT/tmp'
-    }
-"
-
-# Update
-su -c "chroot '$ARCH_ROOT' pacman -Syu"
-
-# Optional: Update Termux scripts
-read -rp "Update Termux wrapper scripts? [y/N]: " update_scripts
-if [[ "$update_scripts" =~ ^[Yy]$ ]]; then
-    echo "Run the main installer to update scripts"
-fi
-EOF
-    chmod +x "$TERMUX_PREFIX/bin/arch-update"
-    
-    log "Scripts created:"
-    info "  arch-chroot  - Enter chroot environment"
-    info "  arch-cli     - Enter CLI with auto-cleanup"
-    info "  arch-gui     - Start KDE Plasma GUI"
-    info "  arch-snapshot - Backup/restore system"
-    info "  arch-update  - Update system packages"
-}
-
-# System fixes and optimizations
-apply_fixes() {
-    log "Applying system fixes..."
-    
-    mount_system
-    
-    # Fix common Android/Termux issues
-    chroot "$ARCH_ROOT" /bin/bash -c '
-        # Fix permissions
-        chmod 755 /var /var/cache /var/lib 2>/dev/null || true
-        
-        # Fix sudo (ensure sudoers.d is included)
-        grep -q "#includedir /etc/sudoers.d" /etc/sudoers || \
-            echo "#includedir /etc/sudoers.d" >> /etc/sudoers
-        
-        # Fix D-Bus machine ID
-        if [[ ! -f /etc/machine-id ]]; then
-            dbus-uuidgen > /etc/machine-id 2>/dev/null || cat /proc/sys/kernel/random/uuid > /etc/machine-id
-        fi
-        
-        # Fix journal directory
-        mkdir -p /var/log/journal
-        systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
-        
-        # Locale generation
-        locale-gen 2>/dev/null || true
-        
-        # Update library cache
-        ldconfig 2>/dev/null || true
-    '
-    
-    # Kernel-specific fixes for Android
-    echo "kernel.unprivileged_userns_clone=1" >> "$ARCH_ROOT/etc/sysctl.d/99-termux.conf" 2>/dev/null || true
-    
-    log "Fixes applied"
-}
-
-# Update existing installation
-update_system() {
-    check_root
-    mount_system
-    apply_fixes
-    
-    log "Updating system..."
-    chroot "$ARCH_ROOT" /bin/bash -c 'pacman -Syu --noconfirm'
-    
-    # Recreate scripts in case of updates
-    create_scripts
-    
-    log "Update complete"
-}
-
-# Main menu
-main_menu() {
-    clear
-    echo "========================================"
-    echo "  Termux Arch Linux Manager v$VERSION"
-    echo "========================================"
-    echo ""
-    echo "  [1] Fresh Install (First Time)"
-    echo "  [2] Install/Update GUI (KDE Plasma)"
-    echo "  [3] Update Existing System"
-    echo "  [4] Enter CLI (with auto-cleanup)"
-    echo "  [5] Start GUI (KDE Plasma)"
-    echo "  [6] Snapshot Manager"
-    echo "  [7] Apply System Fixes"
-    echo "  [8] Unmount/Cleanup"
-    echo ""
-    echo "  [0] Exit"
-    echo ""
-    read -rp "Select option: " choice
-    
-    case "$choice" in
-        1) install_base ;;
-        2) install_gui ;;
-        3) update_system ;;
-        4) exec arch-cli ;;
-        5) exec arch-gui ;;
-        6) arch-snapshot list; read -rp "Press enter..." ;;
-        7) apply_fixes ;;
-        8) unmount_system ;;
-        0) exit 0 ;;
-        *) warn "Invalid option" ;;
-    esac
-    
-    echo ""
-    read -rp "Press enter to continue..."
-    main_menu
-}
-
-# Command line interface
-case "${1:-menu}" in
-    install|i) install_base ;;
-    gui|g) install_gui ;;
-    update|u) update_system ;;
-    cli|c) shift; exec arch-cli "$@" ;;
-    start|s) exec arch-gui ;;
-    snapshot|snap) shift; arch-snapshot "$@" ;;
-    fix|f) apply_fixes ;;
-    umount|um) unmount_system ;;
-    mount|m) mount_system ;;
-    menu|*) main_menu ;;
-esac
+case "${1:-}" i
