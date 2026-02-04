@@ -1,1 +1,1 @@
-# arch-manager
+# ArchLinux Termux Chroot Setup
